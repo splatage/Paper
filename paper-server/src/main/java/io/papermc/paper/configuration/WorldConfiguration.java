@@ -160,6 +160,7 @@ public class WorldConfiguration extends ConfigurationPart {
                 public int verticalRadius = 8;
                 public int maxTargetsConsidered = 64;
                 public int rememberFailedTargetsTicks = 200;
+                public int decisionIntervalTicks = 10;
             }
 
             public class Intelligence extends ConfigurationPart {
@@ -211,6 +212,7 @@ public class WorldConfiguration extends ConfigurationPart {
                 }
 
                 if (this.search != null) {
+                    this.search.decisionIntervalTicks = clamp(this.search.decisionIntervalTicks, 0, 72000);
                     this.search.horizontalRadius = clamp(this.search.horizontalRadius, 0, 128);
                     this.search.verticalRadius = clamp(this.search.verticalRadius, 0, 128);
                     this.search.maxTargetsConsidered = clamp(this.search.maxTargetsConsidered, 1, 512);
