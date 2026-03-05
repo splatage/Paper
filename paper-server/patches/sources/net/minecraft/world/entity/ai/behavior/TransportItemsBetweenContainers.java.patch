@@ -1,10 +1,476 @@
 --- a/net/minecraft/world/entity/ai/behavior/TransportItemsBetweenContainers.java
 +++ b/net/minecraft/world/entity/ai/behavior/TransportItemsBetweenContainers.java
-@@ -320,7 +_,10 @@
+@@ -13,6 +_,7 @@
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.core.Direction;
+ import net.minecraft.core.GlobalPos;
++import net.minecraft.core.registries.BuiltInRegistries;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.world.Container;
+ import net.minecraft.world.entity.EquipmentSlot;
+@@ -20,6 +_,7 @@
+ import net.minecraft.world.entity.ai.memory.MemoryModuleType;
+ import net.minecraft.world.entity.ai.memory.MemoryStatus;
+ import net.minecraft.world.entity.ai.navigation.GroundPathNavigation;
++import net.minecraft.world.entity.animal.golem.CopperGolem;
+ import net.minecraft.world.item.ItemStack;
+ import net.minecraft.world.level.ChunkPos;
+ import net.minecraft.world.level.ClipContext;
+@@ -31,6 +_,7 @@
+ import net.minecraft.world.level.block.state.BlockState;
+ import net.minecraft.world.level.block.state.properties.ChestType;
+ import net.minecraft.world.level.chunk.LevelChunk;
++import net.minecraft.world.level.chunk.status.ChunkStatus;
+ import net.minecraft.world.level.pathfinder.Path;
+ import net.minecraft.world.phys.AABB;
+ import net.minecraft.world.phys.HitResult;
+@@ -38,7 +_,7 @@
+ import org.apache.commons.lang3.function.TriConsumer;
+ import org.jspecify.annotations.Nullable;
+ 
+-public class TransportItemsBetweenContainers extends Behavior<PathfinderMob> {
++    public class TransportItemsBetweenContainers extends Behavior<PathfinderMob> {
+     public static final int TARGET_INTERACTION_TIME = 60;
+     private static final int VISITED_POSITIONS_MEMORY_TIME = 6000;
+     private static final int TRANSPORTED_ITEM_MAX_STACK_SIZE = 16;
+@@ -58,6 +_,7 @@
+     private final Predicate<TransportItemsBetweenContainers.TransportItemTarget> shouldQueueForTarget;
+     private final Consumer<PathfinderMob> onStartTravelling;
+     private final Map<TransportItemsBetweenContainers.ContainerInteractionState, TransportItemsBetweenContainers.OnTargetReachedInteraction> onTargetInteractionActions;
++    
+     private TransportItemsBetweenContainers.@Nullable TransportItemTarget target = null;
+     private TransportItemsBetweenContainers.TransportItemState state;
+     private TransportItemsBetweenContainers.@Nullable ContainerInteractionState interactionState;
+@@ -120,6 +_,7 @@
+ 
+     @Override
+     protected void tick(ServerLevel level, PathfinderMob owner, long gameTime) {
++    final Optional<Integer> cooldown = owner.getBrain().getMemory(MemoryModuleType.TRANSPORT_ITEMS_COOLDOWN_TICKS);
+         boolean flag = this.updateInvalidTarget(level, owner);
+         if (this.target == null) {
+             this.stop(level, owner, gameTime);
+@@ -138,9 +_,45 @@
+         }
+     }
+ 
++    private static boolean containsGlobalPos(Set<GlobalPos> set, net.minecraft.resources.ResourceKey<Level> dim, BlockPos pos) {
++        for (GlobalPos gp : set) {
++            if (gp.dimension() == dim && gp.pos().equals(pos)) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    private boolean paperIsFailedTarget(final ServerLevel level, final PathfinderMob mob, final BlockPos pos) {
++        if (mob instanceof CopperGolem golem) {
++            final var cfg = level.paperConfig().entities.copperGolem;
++            if (cfg.enabled) {
++                final long now = level.getGameTime();
++                return golem.paperFailedTargets().isFailed(pos.asLong(), now);
++            }
++        }
++        return false;
++    }
++
+     private boolean updateInvalidTarget(ServerLevel level, PathfinderMob mob) {
+         if (!this.hasValidTarget(level, mob)) {
+             this.stopTargetingCurrentTarget(mob);
++
++    // Paper/Folia CopperGolem AI (RFC v1.0): decision interval gating (soft skip, no cooldown)
++    if (mob instanceof CopperGolem) {
++        final var cfg = level.paperConfig().entities.copperGolem;
++        if (cfg.enabled) {
++            final int interval = cfg.search.decisionIntervalTicks;
++            if (interval > 0) {
++                final long now = level.getGameTime();
++                final int phase = (int) ((now + (long) mob.getId()) % (long) interval);
++                if (phase != 0) {
++                    return true; // skip acquiring a new target this tick, but do NOT sleep via cooldown
++                }
++            }
++        }
++    }
++
+             Optional<TransportItemsBetweenContainers.TransportItemTarget> transportTarget = this.getTransportTarget(level, mob);
+             if (transportTarget.isPresent()) {
+                 this.target = transportTarget.get();
+@@ -207,11 +_,29 @@
+     }
+ 
+     private void walkTowardsTarget(PathfinderMob mob) {
+-        if (this.target != null) {
++        if (this.target == null) return;
++
++        // Avoid re-setting the same walk target every tick (reduces MoveToTargetSink churn)
++        final var brain = mob.getBrain();
++        final var existing = brain.getMemory(MemoryModuleType.WALK_TARGET);
++    
++        boolean needsSet = true;
++        if (existing.isPresent()) {
++            final var wt = existing.get();
++            // WalkTarget stores a PositionTracker; BlockPosTracker is used elsewhere in this behavior
++            // Only skip if it is targeting the same block pos and speed.
++            if (wt.getTarget() instanceof BlockPosTracker bpt) {
++                if (bpt.currentBlockPosition().equals(this.target.pos) && wt.getSpeedModifier() == this.speedModifier) {
++                    needsSet = false;
++                }
++            }
++        }
++
++        if (needsSet) {
+             BehaviorUtils.setWalkAndLookTargetMemories(mob, this.target.pos, this.speedModifier, 0);
+         }
+     }
+-
++    
+     private void startOnReachedTargetInteraction(TransportItemsBetweenContainers.TransportItemTarget target, PathfinderMob mob) {
+         this.doReachedTargetInteraction(
+             mob,
+@@ -273,35 +_,312 @@
+         }
+     }
+ 
++    private int paperHorizontalSearchDistance(final ServerLevel level, final PathfinderMob owner) {
++        if (owner instanceof CopperGolem) {
++            final var cfg = level.paperConfig().entities.copperGolem;
++            if (cfg.enabled) return cfg.search.horizontalRadius;
++        }
++        return this.getHorizontalSearchDistance(owner);
++    }
++
++    private int paperVerticalSearchDistance(final ServerLevel level, final PathfinderMob owner) {
++        if (owner instanceof CopperGolem) {
++            final var cfg = level.paperConfig().entities.copperGolem;
++            if (cfg.enabled) return cfg.search.verticalRadius;
++        }
++        return this.getVerticalSearchDistance(owner);
++    }
++
++    private int paperMaxTargetsConsidered(final ServerLevel level, final PathfinderMob owner) {
++        if (owner instanceof CopperGolem) {
++            final var cfg = level.paperConfig().entities.copperGolem;
++            if (cfg.enabled) return cfg.search.maxTargetsConsidered;
++        }
++        return Integer.MAX_VALUE;
++    }
++
++    private int paperPickupMaxItemsHeld(final ServerLevel level, final PathfinderMob owner) {
++        if (owner instanceof CopperGolem) {
++            final var cfg = level.paperConfig().entities.copperGolem;
++            if (cfg.enabled) return cfg.pickup.maxItemsHeld;
++        }
++        return TRANSPORTED_ITEM_MAX_STACK_SIZE; // vanilla default behaviour
++    }
++
+     private Optional<TransportItemsBetweenContainers.TransportItemTarget> getTransportTarget(ServerLevel level, PathfinderMob mob) {
+-        AABB targetSearchArea = this.getTargetSearchArea(mob);
+-        Set<GlobalPos> visitedPositions = getVisitedPositions(mob);
+-        Set<GlobalPos> unreachablePositions = getUnreachablePositions(mob);
+-        List<ChunkPos> list = ChunkPos.rangeClosed(new ChunkPos(mob.blockPosition()), Math.floorDiv(this.getHorizontalSearchDistance(mob), 16) + 1).toList();
+-        TransportItemsBetweenContainers.TransportItemTarget transportItemTarget = null;
+-        double d = Float.MAX_VALUE;
+-
+-        for (ChunkPos chunkPos : list) {
+-            LevelChunk chunkNow = level.getChunkSource().getChunkNow(chunkPos.x, chunkPos.z);
+-            if (chunkNow != null) {
+-                for (BlockEntity blockEntity : chunkNow.getBlockEntities().values()) {
+-                    if (blockEntity instanceof ChestBlockEntity chestBlockEntity) {
+-                        double d1 = chestBlockEntity.getBlockPos().distToCenterSqr(mob.position());
+-                        if (d1 < d) {
+-                            TransportItemsBetweenContainers.TransportItemTarget transportItemTarget1 = this.isTargetValidToPick(
+-                                mob, level, chestBlockEntity, visitedPositions, unreachablePositions, targetSearchArea
+-                            );
+-                            if (transportItemTarget1 != null) {
+-                                transportItemTarget = transportItemTarget1;
+-                                d = d1;
++
++    final AABB targetSearchArea = this.getTargetSearchArea(level, mob);
++    final Set<GlobalPos> visitedPositions = getVisitedPositions(mob);
++    final Set<GlobalPos> unreachablePositions = getUnreachablePositions(mob);
++
++    final boolean pickingUp = isPickingUpItems(mob);
++
++    // Paper/Folia CopperGolem AI (RFC v1.0): destination lock fast-path
++    // If locked destination cannot accept current hand item, clear lock (+ last-item memory) and fall back to scan.
++    if (!pickingUp && mob instanceof CopperGolem golem) {
++        final var cfg = level.paperConfig().entities.copperGolem;
++        if (cfg.enabled && cfg.intelligence.rememberDestination) {
++            final long now = level.getGameTime();
++            if (golem.paperIsDestinationLockValid(now)) {
++                final long packed = golem.paperLastDestinationPackedPos();
++                if (packed != Long.MIN_VALUE) {
++                    final BlockPos lockedPos = BlockPos.of(packed);
++
++                    // Must be within current search area (respects config radius)
++                    if (targetSearchArea.contains(lockedPos.getX(), lockedPos.getY(), lockedPos.getZ())) {
++                        final BlockEntity be = level.getBlockEntity(lockedPos);
++                        if (be instanceof ChestBlockEntity chestBe) {
++                            final TransportItemsBetweenContainers.TransportItemTarget lockedTarget =
++                                this.isTargetValidToPick(mob, level, chestBe, visitedPositions, unreachablePositions, targetSearchArea);
++
++                            if (lockedTarget != null) {
++                                // If locked destination can't accept current item, invalidate lock & resume scan
++                                if (!matchesLeavingItemsRequirement(mob, lockedTarget.container)) {
++                                    paperClearDestinationLock(golem, now);
++                                    if (cfg.intelligence.rememberLastItem) {
++                                        paperClearLastItemMemory(golem, now);
++                                    }
++                                } else {
++                                    return Optional.of(lockedTarget);
++                                }
+                             }
+                         }
+                     }
+                 }
+             }
+         }
+-
+-        return transportItemTarget == null ? Optional.empty() : Optional.of(transportItemTarget);
++    }
++
++        final int h = this.paperHorizontalSearchDistance(level, mob);
++        final int maxConsidered = this.paperMaxTargetsConsidered(level, mob);
++        final List<ChunkPos> list = ChunkPos.rangeClosed(new ChunkPos(mob.blockPosition()), Math.floorDiv(h, 16) + 1).toList();
++
++        TransportItemsBetweenContainers.TransportItemTarget best = null;
++        double bestDist = Float.MAX_VALUE;
++
++        boolean preferLastItem = false;
++        String lastItemId = null;
++
++        boolean bestHasLastItem = false;
++        int bestBiggestStack = -1;
++
++        if (mob instanceof CopperGolem golem) {
++            final var cfg = level.paperConfig().entities.copperGolem;
++            if (cfg.enabled && cfg.intelligence.rememberLastItem) {
++                final long now = level.getGameTime();
++                if (pickingUp && golem.paperIsMemoryValid(now)) {
++                    lastItemId = golem.paperLastItemId();
++                    if (lastItemId != null && !lastItemId.isEmpty()) {
++                        preferLastItem = true;
++                    }
++                }
++            }
++        }
++
++        int considered = 0;
++
++    TransportItemsBetweenContainers.TransportItemTarget bestTarget = null;
++    BlockEntity bestBlockEntity = null; // used only when best is a ChestBlockEntity fast-path candidate
++
++    outer:
++    for (ChunkPos chunkPos : list) {
++        final var chunkAccess = level.getChunkSource().getChunk(chunkPos.x, chunkPos.z, ChunkStatus.FULL, false);
++        if (!(chunkAccess instanceof LevelChunk chunkNow)) continue;
++
++    for (BlockPos bePos : chunkNow.getBlockEntitiesPos()) {
++    
++        // Cheap prune BEFORE counting against maxTargetsConsidered.
++        // This prevents BE-dense areas from exhausting the cap before we ever reach later chunks.
++        if (!targetSearchArea.contains(bePos.getX(), bePos.getY(), bePos.getZ())) continue;
++
++        final BlockEntity blockEntity = level.getBlockEntity(bePos);
++        if (blockEntity == null) continue;
++
++        // Cheap prune BEFORE counting against maxTargetsConsidered.
++        final BlockState state0 = blockEntity.getBlockState();
++        if (!this.isWantedBlock(mob, state0)) continue;
++
++        // Only now do we count this as a "considered target".
++        if (++considered > maxConsidered) {
++            break outer;
++        }
++
++        final double dist = bePos.distToCenterSqr(mob.position());
++
++        // Chest fast-path: validate + score without constructing ChestBlock.getContainer for every candidate
++        if (blockEntity instanceof ChestBlockEntity chestBe) {
++            final BlockState state = state0;
++
++            // IMPORTANT: fast-path must not select chests that cannot produce a container (blocked).
++            if (ChestBlock.isChestBlockedAt(level, bePos)) continue;
++
++            // visited/unreachable check including connected chest half
++            BlockPos otherPos = null;
++            ChestBlockEntity otherChest = null;
++            if (state.getValueOrElse(ChestBlock.TYPE, ChestType.SINGLE) != ChestType.SINGLE) {
++                otherPos = ChestBlock.getConnectedBlockPos(bePos, state);
++                final BlockEntity otherBe = level.getBlockEntity(otherPos);
++                if (otherBe instanceof ChestBlockEntity other) {
++                    otherChest = other;
++                } else {
++                    otherPos = null; // if we can't resolve, treat as single for visited/unreachable purposes
++                }
++            }
++
++            final var dim = level.dimension();
++            if (containsGlobalPos(visitedPositions, dim, bePos) || containsGlobalPos(unreachablePositions, dim, bePos)) continue;
++            if (otherPos != null) {
++                if (containsGlobalPos(visitedPositions, dim, otherPos) || containsGlobalPos(unreachablePositions, dim, otherPos)) continue;
++            }
++
++            if (this.paperIsFailedTarget(level, mob, bePos)) continue;
++            
++            // container locked check (same semantics as isContainerLocked)
++            if (chestBe instanceof BaseContainerBlockEntity base && base.isLocked()) continue;
++            if (otherChest instanceof BaseContainerBlockEntity base && base.isLocked()) continue;
++
++            if (!org.bukkit.craftbukkit.event.CraftEventFactory.callTransporterValidateTarget(mob, level, bePos)) continue;
++
++            if (!pickingUp) {
++                // placing: nearest wins
++                if (dist < bestDist) {
++                    bestDist = dist;
++                    bestTarget = null;
++                    bestBlockEntity = chestBe; // build target once at end
++                }
++                continue;
++            }
++
++            // picking up: LAST_ITEM_THEN_BIGGEST_STACK, distance tie-break
++            final boolean hasLast = preferLastItem && paperContainsItemIdChest(chestBe, otherChest, lastItemId);
++            final int biggest = paperBiggestStackSizeChest(chestBe, otherChest);
++
++            boolean replace = false;
++            if (bestTarget == null && bestBlockEntity == null) {
++                replace = true;
++            } else if (hasLast != bestHasLastItem) {
++                replace = hasLast;
++            } else if (biggest != bestBiggestStack) {
++                replace = biggest > bestBiggestStack;
++            } else {
++                replace = dist < bestDist;
++            }
++
++            if (replace) {
++                bestHasLastItem = hasLast;
++                bestBiggestStack = biggest;
++                bestDist = dist;
++                bestTarget = null;
++                bestBlockEntity = chestBe; // build target once at end
++            }
++
++            continue;
++        }
++
++        // Fallback path for non-chest containers: keep existing behavior
++        final TransportItemsBetweenContainers.TransportItemTarget candidate = this.isTargetValidToPick(
++            mob, level, blockEntity, visitedPositions, unreachablePositions, targetSearchArea
++        );
++        if (candidate == null) continue;
++    
++        if (!pickingUp) {
++        if (dist < bestDist) {
++            bestDist = dist;
++            bestTarget = candidate;
++            bestBlockEntity = null;
++        }
++        continue;
++    }
++
++        final boolean hasLast = preferLastItem && paperContainsItemId(candidate.container, lastItemId);
++        final int biggest = paperBiggestStackSize(candidate.container);
++
++        boolean replace = false;
++        if (bestTarget == null && bestBlockEntity == null) {
++            replace = true;
++        } else if (hasLast != bestHasLastItem) {
++            replace = hasLast;
++        } else if (biggest != bestBiggestStack) {
++            replace = biggest > bestBiggestStack;
++        } else {
++            replace = dist < bestDist;
++        }
++
++        if (replace) {
++            bestHasLastItem = hasLast;
++            bestBiggestStack = biggest;
++            bestDist = dist;
++            bestTarget = candidate;
++            bestBlockEntity = null;
++        }
++    }
++}
++
++    // return best
++    if (bestTarget != null) {
++        return Optional.of(bestTarget);
++    }
++    if (bestBlockEntity != null) {
++        final TransportItemsBetweenContainers.TransportItemTarget built =
++            TransportItemsBetweenContainers.TransportItemTarget.tryCreatePossibleTarget(bestBlockEntity, level);
++        return built == null ? Optional.empty() : Optional.of(built);
++    }
++    return Optional.empty();
++}
++
++    private static String paperItemId(final ItemStack stack) {
++        return String.valueOf(BuiltInRegistries.ITEM.getKey(stack.getItem())); 
++    }
++
++    private static void paperClearDestinationLock(final CopperGolem golem, final long now) {
++        // Long.MIN_VALUE is already used as "unset" sentinel in getTransportTarget()
++        golem.paperSetLastDestinationPackedPos(Long.MIN_VALUE, now, 0);
++    }
++
++    private static void paperClearLastItemMemory(final CopperGolem golem, final long now) {
++        // Empty string (and ttl 0) disables prefer-last-item behavior
++        golem.paperSetLastItemId("", now, 0);
++    }
++
++    private static int paperBiggestStackSize(final Container container) {
++        int best = 0;
++        for (ItemStack s : container) {
++            if (!s.isEmpty() && s.getCount() > best) best = s.getCount();
++        }
++        return best;
++    }
++
++    private static boolean paperContainsItemId(final Container container, final String itemId) {
++        for (ItemStack s : container) {
++            if (!s.isEmpty() && itemId.equals(paperItemId(s))) return true;
++        }
++        return false;
++    }
++
++    // Chest fast-path helpers (avoid ChestBlock.getContainer during scan)
++    private static int paperBiggestStackSizeChest(final ChestBlockEntity a, final @Nullable ChestBlockEntity b) {
++        int best = 0;
++        for (ItemStack s : a) {
++            if (!s.isEmpty() && s.getCount() > best) best = s.getCount();
++        }
++        if (b != null) {
++            for (ItemStack s : b) {
++                if (!s.isEmpty() && s.getCount() > best) best = s.getCount();
++            }
++        }
++        return best;
++    }
++
++    private static boolean paperContainsItemIdChest(final ChestBlockEntity a, final @Nullable ChestBlockEntity b, final String itemId) {
++        for (ItemStack s : a) {
++            if (!s.isEmpty() && itemId.equals(paperItemId(s))) return true;
++        }
++        if (b != null) {
++            for (ItemStack s : b) {
++                if (!s.isEmpty() && itemId.equals(paperItemId(s))) return true;
++            }
++        }
++        return false;
+     }
+ 
+     private TransportItemsBetweenContainers.@Nullable TransportItemTarget isTargetValidToPick(
+@@ -318,9 +_,14 @@
+             if (transportItemTarget == null) {
+                 return null;
              } else {
++
                  boolean flag1 = this.isWantedBlock(mob, transportItemTarget.state)
                      && !this.isPositionAlreadyVisited(visitedPositions, unreachablePositions, transportItemTarget, level)
 -                    && !this.isContainerLocked(transportItemTarget);
++                    && !(level instanceof ServerLevel serverLevel && this.paperIsFailedTarget(serverLevel, mob, transportItemTarget.pos))
 +                    // Paper start - ItemTransportingEntityValidateTargetEvent
 +                    && !this.isContainerLocked(transportItemTarget)
 +                    && org.bukkit.craftbukkit.event.CraftEventFactory.callTransporterValidateTarget(mob, level, transportItemTarget.pos);
@@ -12,3 +478,331 @@
                  return flag1 ? transportItemTarget : null;
              }
          }
+@@ -348,11 +_,20 @@
+     }
+ 
+     private boolean hasValidTravellingPath(Level level, TransportItemsBetweenContainers.TransportItemTarget target, PathfinderMob mob) {
+-        Path path = mob.getNavigation().getPath() == null ? mob.getNavigation().createPath(target.pos, 0) : mob.getNavigation().getPath();
+-        Vec3 positionToReachTargetFrom = this.getPositionToReachTargetFrom(path, mob);
+-        boolean isWithinTargetDistance = this.isWithinTargetDistance(getInteractionRange(mob), target, level, mob, positionToReachTargetFrom);
+-        boolean flag = path == null && !isWithinTargetDistance;
+-        return flag || this.targetIsReachableFromPosition(level, isWithinTargetDistance, positionToReachTargetFrom, target, mob);
++        final Path path = mob.getNavigation().getPath();
++
++        // If navigation hasn't produced a path yet, do NOT force a synchronous path calculation here.
++        // Keep the target and let MoveToTargetSink/navigation compute it via WALK_TARGET.
++        if (path == null) {
++            return true;
++        }
++
++        final Vec3 positionToReachTargetFrom = this.getPositionToReachTargetFrom(path, mob);
++        final boolean isWithinTargetDistance = this.isWithinTargetDistance(
++            getInteractionRange(mob), target, level, mob, positionToReachTargetFrom
++        );
++
++        return this.targetIsReachableFromPosition(level, isWithinTargetDistance, positionToReachTargetFrom, target, mob);
+     }
+ 
+     private Vec3 getPositionToReachTargetFrom(@Nullable Path path, PathfinderMob mob) {
+@@ -373,22 +_,20 @@
+         return target.blockEntity.equals(level.getBlockEntity(target.pos));
+     }
+ 
+-    private Stream<TransportItemsBetweenContainers.TransportItemTarget> getConnectedTargets(
++    private TransportItemsBetweenContainers.TransportItemTarget getConnectedTarget(
+         TransportItemsBetweenContainers.TransportItemTarget target, Level level
+     ) {
+-        if (target.state.getValueOrElse(ChestBlock.TYPE, ChestType.SINGLE) != ChestType.SINGLE) {
+-            TransportItemsBetweenContainers.TransportItemTarget transportItemTarget = TransportItemsBetweenContainers.TransportItemTarget.tryCreatePossibleTarget(
+-                ChestBlock.getConnectedBlockPos(target.pos, target.state), level
+-            );
+-            return transportItemTarget != null ? Stream.of(target, transportItemTarget) : Stream.of(target);
+-        } else {
+-            return Stream.of(target);
++        if (target.state.getValueOrElse(ChestBlock.TYPE, ChestType.SINGLE) == ChestType.SINGLE) {
++            return null;
+         }
++        final BlockPos otherPos = ChestBlock.getConnectedBlockPos(target.pos, target.state);
++        return TransportItemsBetweenContainers.TransportItemTarget.tryCreatePossibleTarget(otherPos, level);
+     }
+ 
+-    private AABB getTargetSearchArea(PathfinderMob mob) {
+-        int horizontalSearchDistance = this.getHorizontalSearchDistance(mob);
+-        return new AABB(mob.blockPosition()).inflate(horizontalSearchDistance, this.getVerticalSearchDistance(mob), horizontalSearchDistance);
++    private AABB getTargetSearchArea(ServerLevel level, PathfinderMob mob) {
++        final int h = this.paperHorizontalSearchDistance(level, mob);
++        final int v = this.paperVerticalSearchDistance(level, mob);
++        return new AABB(mob.blockPosition()).inflate(h, v, h);
+     }
+ 
+     private int getHorizontalSearchDistance(PathfinderMob mob) {
+@@ -408,11 +_,21 @@
+     }
+ 
+     private boolean isPositionAlreadyVisited(
+-        Set<GlobalPos> visitedPositions, Set<GlobalPos> unreachablePositions, TransportItemsBetweenContainers.TransportItemTarget target, Level level
++        Set<GlobalPos> visitedPositions, Set<GlobalPos> unreachablePositions,
++        TransportItemsBetweenContainers.TransportItemTarget target, Level level
+     ) {
+-        return this.getConnectedTargets(target, level)
+-            .map(transportItemTarget -> new GlobalPos(level.dimension(), transportItemTarget.pos))
+-            .anyMatch(globalPos -> visitedPositions.contains(globalPos) || unreachablePositions.contains(globalPos));
++        final var dim = level.dimension();
++
++        if (containsGlobalPos(visitedPositions, dim, target.pos) || containsGlobalPos(unreachablePositions, dim, target.pos)) {
++            return true;
++        }
++
++        final TransportItemsBetweenContainers.TransportItemTarget other = this.getConnectedTarget(target, level);
++        if (other != null) {
++            return containsGlobalPos(visitedPositions, dim, other.pos) || containsGlobalPos(unreachablePositions, dim, other.pos);
++        }
++
++        return false;
+     }
+ 
+     private static boolean hasFinishedPath(PathfinderMob mob) {
+@@ -430,6 +_,18 @@
+     }
+ 
+     protected void markVisitedBlockPosAsUnreachable(PathfinderMob mob, Level level, BlockPos pos) {
++        // Paper/Folia CopperGolem AI (RFC v1.0): remember failed targets to avoid repeat work
++        if (mob instanceof CopperGolem golem && level instanceof ServerLevel serverLevel) {
++            final var cfg = serverLevel.paperConfig().entities.copperGolem;
++            if (cfg.enabled) {
++                final long now = serverLevel.getGameTime();
++                final long ttl = cfg.search.rememberFailedTargetsTicks;
++                if (ttl > 0) {
++                    golem.paperFailedTargets().noteFailed(pos.asLong(), now + ttl);
++                }
++            }
++        }
++
+         Set<GlobalPos> set = new HashSet<>(getVisitedPositions(mob));
+         set.remove(new GlobalPos(level.dimension(), pos));
+         Set<GlobalPos> set1 = new HashSet<>(getUnreachablePositions(mob));
+@@ -465,15 +_,30 @@
+     }
+ 
+     private boolean canSeeAnyTargetSide(TransportItemsBetweenContainers.TransportItemTarget target, Level level, PathfinderMob mob, Vec3 pos) {
+-        Vec3 center = target.pos.getCenter();
+-        return Direction.stream()
+-            .map(direction -> center.add(0.5 * direction.getStepX(), 0.5 * direction.getStepY(), 0.5 * direction.getStepZ()))
+-            .map(vec3 -> level.clip(new ClipContext(pos, vec3, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, mob)))
+-            .anyMatch(blockHitResult -> blockHitResult.getType() == HitResult.Type.BLOCK && blockHitResult.getBlockPos().equals(target.pos));
++        final Vec3 center = target.pos.getCenter();
++
++        for (Direction direction : Direction.values()) {
++            final Vec3 to = center.add(
++                0.5 * direction.getStepX(),
++                0.5 * direction.getStepY(),
++                0.5 * direction.getStepZ()
++            );
++
++            final HitResult hit = level.clip(new ClipContext(pos, to, ClipContext.Block.COLLIDER, ClipContext.Fluid.NONE, mob));
++            if (hit.getType() == HitResult.Type.BLOCK && ((net.minecraft.world.phys.BlockHitResult) hit).getBlockPos().equals(target.pos)) {
++                return true;
++            }
++        }
++
++        return false;
+     }
+ 
+     private boolean isAnotherMobInteractingWithTarget(TransportItemsBetweenContainers.TransportItemTarget target, Level level) {
+-        return this.getConnectedTargets(target, level).anyMatch(this.shouldQueueForTarget);
++        if (this.shouldQueueForTarget.test(target)) {
++            return true;
++        }
++        final TransportItemsBetweenContainers.TransportItemTarget other = this.getConnectedTarget(target, level);
++        return other != null && this.shouldQueueForTarget.test(other);
+     }
+ 
+     private static boolean isPickingUpItems(PathfinderMob mob) {
+@@ -500,38 +_,134 @@
+         return false;
+     }
+ 
+-    private void pickUpItems(PathfinderMob mob, Container container) {
+-        mob.setItemSlot(EquipmentSlot.MAINHAND, pickupItemFromContainer(container));
+-        mob.setGuaranteedDrop(EquipmentSlot.MAINHAND);
+-        container.setChanged();
++private void pickUpItems(PathfinderMob mob, Container container) {
++    final int pickupLimit;
++    if (mob.level() instanceof ServerLevel serverLevel) {
++        pickupLimit = this.paperPickupMaxItemsHeld(serverLevel, mob);
++    } else {
++        pickupLimit = TRANSPORTED_ITEM_MAX_STACK_SIZE;
++    }
++
++    // Paper/Folia CopperGolem AI: use last-item memory to choose WHAT item is picked up.
++    final @Nullable String preferredItemId;
++    if (mob instanceof CopperGolem golem && mob.level() instanceof ServerLevel serverLevel) {
++        final var cfg = serverLevel.paperConfig().entities.copperGolem;
++        if (cfg.enabled && cfg.intelligence.rememberLastItem) {
++            final long now = serverLevel.getGameTime();
++            preferredItemId = golem.paperIsMemoryValid(now) ? golem.paperLastItemId() : null;
++        } else {
++            preferredItemId = null;
++        }
++    } else {
++        preferredItemId = null;
++    }
++
++    mob.setItemSlot(EquipmentSlot.MAINHAND, pickupItemFromContainer(container, pickupLimit, preferredItemId));
++    mob.setGuaranteedDrop(EquipmentSlot.MAINHAND);
++    container.setChanged();
++    this.clearMemoriesAfterMatchingTargetFound(mob);
++
++    // Paper/Folia CopperGolem AI (RFC v1.0): remember last item + hard sleep cooldown
++    if (mob instanceof CopperGolem golem && mob.level() instanceof ServerLevel serverLevel) {
++        final var cfg = serverLevel.paperConfig().entities.copperGolem;
++        if (cfg.enabled) {
++            final long now = serverLevel.getGameTime();
++            if (cfg.intelligence.rememberLastItem) {
++                final ItemStack hand = mob.getMainHandItem();
++                if (!hand.isEmpty()) {
++                    final String itemId = String.valueOf(BuiltInRegistries.ITEM.getKey(hand.getItem()));
++                    golem.paperSetLastItemId(itemId, now, cfg.intelligence.memoryTtlTicks);
++                }
++            }
++            if (cfg.pickup.pickupCooldownTicks > 0) {
++                final int cd = cfg.pickup.pickupCooldownTicks;
++                mob.getBrain().setMemory(MemoryModuleType.TRANSPORT_ITEMS_COOLDOWN_TICKS, cd);
++            }
++        }
++    }
++}
++
++private void putDownItem(PathfinderMob mob, Container container) {
++    ItemStack remaining = addItemsToContainer(mob, container);
++    container.setChanged();
++    mob.setItemSlot(EquipmentSlot.MAINHAND, remaining);
++
++    if (remaining.isEmpty()) {
++        // Paper/Folia CopperGolem AI: remember destination ONLY on full success (hand emptied).
++        if (mob instanceof CopperGolem golem && mob.level() instanceof ServerLevel serverLevel && this.target != null) {
++            final var cfg = serverLevel.paperConfig().entities.copperGolem;
++            if (cfg.enabled && cfg.intelligence.rememberDestination) {
++                final long now = serverLevel.getGameTime();
++                golem.paperSetLastDestinationPackedPos(this.target.pos.asLong(), now, cfg.intelligence.destinationLockTicks);
++            }
++        }
++
+         this.clearMemoriesAfterMatchingTargetFound(mob);
+-    }
+-
+-    private void putDownItem(PathfinderMob mob, Container container) {
+-        ItemStack itemStack = addItemsToContainer(mob, container);
+-        container.setChanged();
+-        mob.setItemSlot(EquipmentSlot.MAINHAND, itemStack);
+-        if (itemStack.isEmpty()) {
+-            this.clearMemoriesAfterMatchingTargetFound(mob);
+-        } else {
+-            this.stopTargetingCurrentTarget(mob);
+-        }
+-    }
+-
+-    private static ItemStack pickupItemFromContainer(Container container) {
++
++        if (mob instanceof CopperGolem && mob.level() instanceof ServerLevel serverLevel) {
++            final var cfg = serverLevel.paperConfig().entities.copperGolem;
++            if (cfg.enabled && cfg.pickup.putdownCooldownTicks > 0) {
++                final int cd = cfg.pickup.putdownCooldownTicks;
++                mob.getBrain().setMemory(MemoryModuleType.TRANSPORT_ITEMS_COOLDOWN_TICKS, cd);
++            }
++        }
++    } else {
++        // Could not empty hand -> scanning again is correct, but do not keep reusing a stale destination lock.
++        if (mob instanceof CopperGolem golem && mob.level() instanceof ServerLevel serverLevel) {
++            final var cfg = serverLevel.paperConfig().entities.copperGolem;
++            if (cfg.enabled && cfg.intelligence.rememberDestination) {
++                final long now = serverLevel.getGameTime();
++                paperClearDestinationLock(golem, now);
++            }
++        }
++
++        this.stopTargetingCurrentTarget(mob);
++    }
++}
++
++private static ItemStack pickupItemFromContainer(final Container container, final int pickupLimit) {
++    return pickupItemFromContainer(container, pickupLimit, null);
++}
++
++private static ItemStack pickupItemFromContainer(final Container container, final int pickupLimit, final @Nullable String preferredItemId) {
++    final int limit = Math.max(1, pickupLimit);
++
++    // 1) If last item is remembered: pick FIRST slot position that matches.
++    if (preferredItemId != null && !preferredItemId.isEmpty()) {
+         int i = 0;
+-
+-        for (ItemStack itemStack : container) {
+-            if (!itemStack.isEmpty()) {
+-                int min = Math.min(itemStack.getCount(), 16);
++        for (ItemStack s : container) {
++            if (!s.isEmpty() && preferredItemId.equals(paperItemId(s))) {
++                final int min = Math.min(s.getCount(), limit);
+                 return container.removeItem(i, min);
+             }
+-
+             i++;
+         }
+-
+-        return ItemStack.EMPTY;
+-    }
++        // If the preferred item isn't present, fall through to largest-stack selection.
++    }
++
++    // 2) If no last item remembered (or not found): pick LARGEST stack, tie-break FIRST slot position.
++    int bestIndex = -1;
++    int bestCount = 0;
++
++    int i = 0;
++    for (ItemStack s : container) {
++        if (!s.isEmpty()) {
++            final int count = s.getCount();
++            if (bestIndex == -1 || count > bestCount) { // '>' preserves first-slot tie-break
++                bestIndex = i;
++                bestCount = count;
++            }
++        }
++        i++;
++    }
++
++    if (bestIndex != -1) {
++        final int min = Math.min(bestCount, limit);
++        return container.removeItem(bestIndex, min);
++    }
++
++    return ItemStack.EMPTY;
++}
+ 
+     private static ItemStack addItemsToContainer(PathfinderMob mob, Container container) {
+         int i = 0;
+@@ -547,7 +_,7 @@
+                 int i1 = itemStack.getMaxStackSize() - itemStack.getCount();
+                 int min = Math.min(i1, mainHandItem.getCount());
+                 itemStack.setCount(itemStack.getCount() + min);
+-                mainHandItem.setCount(mainHandItem.getCount() - i1);
++                mainHandItem.setCount(mainHandItem.getCount() - min);
+                 container.setItem(i, itemStack);
+                 if (mainHandItem.isEmpty()) {
+                     return ItemStack.EMPTY;
+@@ -575,7 +_,16 @@
+ 
+     private void enterCooldownAfterNoMatchingTargetFound(PathfinderMob mob) {
+         this.stopTargetingCurrentTarget(mob);
+-        mob.getBrain().setMemory(MemoryModuleType.TRANSPORT_ITEMS_COOLDOWN_TICKS, 140);
++
++        int cooldown = 140;
++        if (mob instanceof CopperGolem && mob.level() instanceof ServerLevel serverLevel) {
++            final var cfg = serverLevel.paperConfig().entities.copperGolem;
++            if (cfg.enabled) {
++                cooldown = cfg.pickup.retryDelayTicks;
++            }
++        }
++
++        mob.getBrain().setMemory(MemoryModuleType.TRANSPORT_ITEMS_COOLDOWN_TICKS, cooldown);
+         mob.getBrain().eraseMemory(MemoryModuleType.VISITED_BLOCK_POSITIONS);
+         mob.getBrain().eraseMemory(MemoryModuleType.UNREACHABLE_TRANSPORT_BLOCK_POSITIONS);
+     }
