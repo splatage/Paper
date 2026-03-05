@@ -1,11 +1,29 @@
 --- a/net/minecraft/world/entity/animal/golem/CopperGolem.java
 +++ b/net/minecraft/world/entity/animal/golem/CopperGolem.java
-@@ -57,8 +_,8 @@
+@@ -57,8 +_,26 @@
  import org.jspecify.annotations.Nullable;
  
  public class CopperGolem extends AbstractGolem implements ContainerUser, Shearable {
 -    private static final long IGNORE_WEATHERING_TICK = -2L;
 -    private static final long UNSET_WEATHERING_TICK = -1L;
++
++    // Paper/Folia CopperGolem AI tuning (RFC v1.0): smart memory + sleep cooldown.
++    // Persisted:
++    private String paperLastItemId; // e.g. "minecraft:iron_ingot"
++    private long paperLastDestinationPackedPos = Long.MIN_VALUE;
++
++    // Runtime-only:
++    private long paperMemoryExpiryTick = 0L;
++    private long paperDestinationLockExpiryTick = 0L;
++
++     // NOTE (RFC v1.0): No entity-field sleep/decision timers.
++    // Gating is done via Brain memory: MemoryModuleType.TRANSPORT_ITEMS_COOLDOWN_TICKS
++
++
++    // Failed target cache: packed blockpos -> expiryTick (bounded LRU)
++    // Stored runtime-only to avoid save bloat
++    private final io.papermc.paper.util.FailedTargetLRU paperFailedTargets = new io.papermc.paper.util.FailedTargetLRU(32);
++
 +    public static final long IGNORE_WEATHERING_TICK = -2L; // Paper - public
 +    public static final long UNSET_WEATHERING_TICK = -1L; // Paper - public
      private static final int WEATHERING_TICK_FROM = 504000;
@@ -20,6 +38,111 @@
      private int idleAnimationStartTick = 0;
      private final AnimationState idleAnimationState = new AnimationState();
      private final AnimationState interactionGetItemAnimationState = new AnimationState();
+@@ -84,6 +_,43 @@
+     private final AnimationState interactionDropNoItemAnimationState = new AnimationState();
+     public static final EquipmentSlot EQUIPMENT_SLOT_ANTENNA = EquipmentSlot.SADDLE;
+ 
++    public void paperClearSmartMemory() {
++        this.paperLastItemId = null;
++        this.paperLastDestinationPackedPos = Long.MIN_VALUE;
++        this.paperMemoryExpiryTick = 0L;
++        this.paperDestinationLockExpiryTick = 0L;
++    }
++
++    public String paperLastItemId() {
++        return this.paperLastItemId;
++    }
++
++    public void paperSetLastItemId(final String itemId, final long nowTick, final long ttlTicks) {
++        this.paperLastItemId = itemId;
++        this.paperMemoryExpiryTick = (itemId == null) ? 0L : (nowTick + Math.max(0L, ttlTicks));
++    }
++
++    public long paperLastDestinationPackedPos() {
++        return this.paperLastDestinationPackedPos;
++    }
++
++    public void paperSetLastDestinationPackedPos(final long packedPos, final long nowTick, final long lockTicks) {
++        this.paperLastDestinationPackedPos = packedPos;
++        this.paperDestinationLockExpiryTick = (packedPos == Long.MIN_VALUE) ? 0L : (nowTick + Math.max(0L, lockTicks));
++    }
++
++    public boolean paperIsMemoryValid(final long nowTick) {
++        return this.paperLastItemId != null && nowTick < this.paperMemoryExpiryTick;
++    }
++
++    public boolean paperIsDestinationLockValid(final long nowTick) {
++        return this.paperLastDestinationPackedPos != Long.MIN_VALUE && nowTick < this.paperDestinationLockExpiryTick;
++    }
++
++    public io.papermc.paper.util.FailedTargetLRU paperFailedTargets() {
++        return this.paperFailedTargets;
++    }
++
+     public CopperGolem(EntityType<? extends AbstractGolem> type, Level level) {
+         super(type, level);
+         this.getNavigation().setRequiredPathLength(48.0F);
+@@ -171,6 +_,21 @@
+         super.addAdditionalSaveData(output);
+         output.putLong("next_weather_age", this.nextWeatheringTick);
+         output.store("weather_state", WeatheringCopper.WeatherState.CODEC, this.getWeatherState());
++
++        // Paper/Folia CopperGolem AI (RFC v1.0): persist smart memory (+ remaining TTL)
++        final long now = this.level() instanceof ServerLevel sl ? sl.getGameTime() : 0L;
++
++        if (this.paperLastItemId != null && !this.paperLastItemId.isEmpty()) {
++            output.putString("paper_copper_golem_last_item_id", this.paperLastItemId);
++            final long remaining = Math.max(0L, this.paperMemoryExpiryTick - now);
++            output.putLong("paper_copper_golem_last_item_ttl", remaining);
++        }
++
++        if (this.paperLastDestinationPackedPos != Long.MIN_VALUE) {
++            output.putLong("paper_copper_golem_last_dest", this.paperLastDestinationPackedPos);
++            final long remaining = Math.max(0L, this.paperDestinationLockExpiryTick - now);
++            output.putLong("paper_copper_golem_last_dest_ttl", remaining);
++        }
+     }
+ 
+     @Override
+@@ -178,10 +_,38 @@
+         super.readAdditionalSaveData(input);
+         this.nextWeatheringTick = input.getLongOr("next_weather_age", -1L);
+         this.setWeatherState(input.read("weather_state", WeatheringCopper.WeatherState.CODEC).orElse(WeatheringCopper.WeatherState.UNAFFECTED));
++
++        // Paper/Folia CopperGolem AI (RFC v1.0): load smart memory (+ TTL remaining)
++        this.paperLastItemId = input.getStringOr("paper_copper_golem_last_item_id", null);
++        if (this.paperLastItemId != null && this.paperLastItemId.isEmpty()) {
++            this.paperLastItemId = null;
++        }
++        final long itemRemaining = input.getLongOr("paper_copper_golem_last_item_ttl", 0L);
++
++        this.paperLastDestinationPackedPos = input.getLongOr("paper_copper_golem_last_dest", Long.MIN_VALUE);
++        final long destRemaining = input.getLongOr("paper_copper_golem_last_dest_ttl", 0L);
++
++        // We can’t resolve to absolute gameTime here reliably; we store remaining ticks and
++        // initialize expiry on first server AI step (see customServerAiStep patch).
++        // Temporarily store as “remaining” by setting expiry to remaining.
++        this.paperMemoryExpiryTick = itemRemaining; // interpreted as remaining until initialized
++        this.paperDestinationLockExpiryTick = destRemaining; // interpreted as remaining until initialized
+     }
+ 
+     @Override
+     protected void customServerAiStep(ServerLevel level) {
++        // Paper/Folia CopperGolem AI (RFC v1.0): initialize persisted TTL remaining -> expiry tick
++        final long now = level.getGameTime();
++
++        // If these fields are "small" values after load, they represent remaining TTL.
++        // Convert them once, then operate normally as absolute expiry.
++        if (this.paperLastItemId != null && this.paperMemoryExpiryTick > 0L && this.paperMemoryExpiryTick < 72000L * 2L) {
++            this.paperMemoryExpiryTick = now + this.paperMemoryExpiryTick;
++        }
++        if (this.paperLastDestinationPackedPos != Long.MIN_VALUE && this.paperDestinationLockExpiryTick > 0L && this.paperDestinationLockExpiryTick < 72000L * 2L) {
++            this.paperDestinationLockExpiryTick = now + this.paperDestinationLockExpiryTick;
++        }
++
+         ProfilerFiller profilerFiller = Profiler.get();
+         profilerFiller.push("copperGolemBrain");
+         this.getBrain().tick(level, this);
 @@ -219,7 +_,15 @@
          Level level = this.level();
          if (itemInHand.is(Items.SHEARS) && this.readyForShearing()) {

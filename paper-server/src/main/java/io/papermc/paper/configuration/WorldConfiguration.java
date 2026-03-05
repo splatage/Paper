@@ -134,6 +134,117 @@ public class WorldConfiguration extends ConfigurationPart {
     public Entities entities;
 
     public class Entities extends ConfigurationPart {
+
+        // Inside WorldConfiguration.Entities (same level as Spawning/Behavior/TrackingRangeY)
+        public CopperGolem copperGolem;
+
+        public class CopperGolem extends ConfigurationPart {
+            public boolean enabled = true;
+
+            public Pickup pickup;
+            public Search search;
+            public Intelligence intelligence;
+            public Prioritization prioritization;
+            public Rules rules;
+            public Debugging debugging;
+
+            public class Pickup extends ConfigurationPart {
+                public int maxItemsHeld = 64;
+                public int pickupCooldownTicks = 20;
+                public int putdownCooldownTicks = 10;
+                public int retryDelayTicks = 40;
+            }
+
+            public class Search extends ConfigurationPart {
+                public int horizontalRadius = 32;
+                public int verticalRadius = 8;
+                public int maxTargetsConsidered = 64;
+                public int rememberFailedTargetsTicks = 200;
+                public int decisionIntervalTicks = 10;
+            }
+
+            public class Intelligence extends ConfigurationPart {
+                public boolean rememberLastItem = true;
+                public boolean rememberDestination = true;
+                public int memoryTtlTicks = 2400;
+                public int destinationLockTicks = 600;
+                public boolean allowCrossContainerRouting = true;
+            }
+
+            public class Prioritization extends ConfigurationPart {
+                public PrioritizationStrategy strategy = PrioritizationStrategy.LAST_ITEM_THEN_BIGGEST_STACK;
+
+                public int preferSameItemBonus = 100;
+                public double biggerStackWeight = 1.0;
+                public double distanceWeight = 1.0;
+                public int recentlyVisitedPenalty = 50;
+            }
+
+            public enum PrioritizationStrategy {
+                LAST_ITEM_THEN_BIGGEST_STACK,
+                BIGGEST_STACK_ONLY,
+                NEAREST_FIRST,
+                WEIGHTED_SCORE
+            }
+
+            public class Rules extends ConfigurationPart {
+                public boolean matchOxidationLevel = false;
+                public boolean allowInsertIntoContainers = false; // shulker/bundle insertion rules (later phase)
+                public boolean ignoreShulkerColor = true;
+                public boolean allowIndividualItemsMatchContainerContents = true;
+            }
+
+            public class Debugging extends ConfigurationPart {
+                public boolean logDecisions = false;
+                public int logRateLimitTicks = 200;
+            }
+
+            // Validation/clamping (match whatever annotation style WorldConfiguration already uses)
+            @PostProcess
+            private void postProcess() {
+                // enabled: no clamp needed
+
+                if (this.pickup != null) {
+                    this.pickup.maxItemsHeld = clamp(this.pickup.maxItemsHeld, 1, 64);
+                    this.pickup.pickupCooldownTicks = clamp(this.pickup.pickupCooldownTicks, 0, 72000);
+                    this.pickup.putdownCooldownTicks = clamp(this.pickup.putdownCooldownTicks, 0, 72000);
+                    this.pickup.retryDelayTicks = clamp(this.pickup.retryDelayTicks, 0, 72000);
+                }
+
+                if (this.search != null) {
+                    this.search.decisionIntervalTicks = clamp(this.search.decisionIntervalTicks, 0, 72000);
+                    this.search.horizontalRadius = clamp(this.search.horizontalRadius, 0, 128);
+                    this.search.verticalRadius = clamp(this.search.verticalRadius, 0, 128);
+                    this.search.maxTargetsConsidered = clamp(this.search.maxTargetsConsidered, 1, 512);
+                    this.search.rememberFailedTargetsTicks = clamp(this.search.rememberFailedTargetsTicks, 0, 72000);
+                }
+
+                if (this.intelligence != null) {
+                    this.intelligence.memoryTtlTicks = clamp(this.intelligence.memoryTtlTicks, 0, 72000);
+                    this.intelligence.destinationLockTicks = clamp(this.intelligence.destinationLockTicks, 0, 72000);
+                }
+
+                if (this.prioritization != null) {
+                    this.prioritization.preferSameItemBonus = clamp(this.prioritization.preferSameItemBonus, 0, 10000);
+                    this.prioritization.biggerStackWeight = clamp(this.prioritization.biggerStackWeight, 0.0, 10.0);
+                    this.prioritization.distanceWeight = clamp(this.prioritization.distanceWeight, 0.0, 10.0);
+                    this.prioritization.recentlyVisitedPenalty = clamp(this.prioritization.recentlyVisitedPenalty, 0, 10000);
+                }
+
+                if (this.debugging != null) {
+                    this.debugging.logRateLimitTicks = clamp(this.debugging.logRateLimitTicks, 0, 72000);
+                }
+            }
+
+            private static int clamp(final int v, final int min, final int max) {
+                return Math.min(Math.max(v, min), max);
+            }
+
+            private static double clamp(final double v, final double min, final double max) {
+                return Math.min(Math.max(v, min), max);
+            }
+        }
+
         public MobEffects mobEffects;
 
         public class MobEffects extends ConfigurationPart {
