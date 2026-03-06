@@ -127,7 +127,7 @@
      private void startOnReachedTargetInteraction(TransportItemsBetweenContainers.TransportItemTarget target, PathfinderMob mob) {
          this.doReachedTargetInteraction(
              mob,
-@@ -273,35 +_,312 @@
+@@ -273,35 +_,260 @@
          }
      }
  
@@ -145,14 +145,6 @@
 +            if (cfg.enabled) return cfg.search.verticalRadius;
 +        }
 +        return this.getVerticalSearchDistance(owner);
-+    }
-+
-+    private int paperMaxTargetsConsidered(final ServerLevel level, final PathfinderMob owner) {
-+        if (owner instanceof CopperGolem) {
-+            final var cfg = level.paperConfig().entities.copperGolem;
-+            if (cfg.enabled) return cfg.search.maxTargetsConsidered;
-+        }
-+        return Integer.MAX_VALUE;
 +    }
 +
 +    private int paperPickupMaxItemsHeld(final ServerLevel level, final PathfinderMob owner) {
@@ -230,17 +222,14 @@
 +    }
 +
 +        final int h = this.paperHorizontalSearchDistance(level, mob);
-+        final int maxConsidered = this.paperMaxTargetsConsidered(level, mob);
 +        final List<ChunkPos> list = ChunkPos.rangeClosed(new ChunkPos(mob.blockPosition()), Math.floorDiv(h, 16) + 1).toList();
 +
-+        TransportItemsBetweenContainers.TransportItemTarget best = null;
 +        double bestDist = Float.MAX_VALUE;
 +
 +        boolean preferLastItem = false;
 +        String lastItemId = null;
 +
 +        boolean bestHasLastItem = false;
-+        int bestBiggestStack = -1;
 +
 +        if (mob instanceof CopperGolem golem) {
 +            final var cfg = level.paperConfig().entities.copperGolem;
@@ -255,33 +244,22 @@
 +            }
 +        }
 +
-+        int considered = 0;
-+
 +    TransportItemsBetweenContainers.TransportItemTarget bestTarget = null;
 +    BlockEntity bestBlockEntity = null; // used only when best is a ChestBlockEntity fast-path candidate
 +
-+    outer:
 +    for (ChunkPos chunkPos : list) {
 +        final var chunkAccess = level.getChunkSource().getChunk(chunkPos.x, chunkPos.z, ChunkStatus.FULL, false);
 +        if (!(chunkAccess instanceof LevelChunk chunkNow)) continue;
 +
 +    for (BlockPos bePos : chunkNow.getBlockEntitiesPos()) {
 +    
-+        // Cheap prune BEFORE counting against maxTargetsConsidered.
-+        // This prevents BE-dense areas from exhausting the cap before we ever reach later chunks.
 +        if (!targetSearchArea.contains(bePos.getX(), bePos.getY(), bePos.getZ())) continue;
 +
 +        final BlockEntity blockEntity = level.getBlockEntity(bePos);
 +        if (blockEntity == null) continue;
 +
-+        // Cheap prune BEFORE counting against maxTargetsConsidered.
 +        final BlockState state0 = blockEntity.getBlockState();
 +        if (!this.isWantedBlock(mob, state0)) continue;
-+
-+        // Only now do we count this as a "considered target".
-+        if (++considered > maxConsidered) {
-+            break outer;
-+        }
 +
 +        final double dist = bePos.distToCenterSqr(mob.position());
 +
@@ -329,24 +307,20 @@
 +                continue;
 +            }
 +
-+            // picking up: LAST_ITEM_THEN_BIGGEST_STACK, distance tie-break
++            // picking up: prefer remembered item when available, otherwise nearest wins
 +            final boolean hasLast = preferLastItem && paperContainsItemIdChest(chestBe, otherChest, lastItemId);
-+            final int biggest = paperBiggestStackSizeChest(chestBe, otherChest);
 +
 +            boolean replace = false;
 +            if (bestTarget == null && bestBlockEntity == null) {
 +                replace = true;
 +            } else if (hasLast != bestHasLastItem) {
 +                replace = hasLast;
-+            } else if (biggest != bestBiggestStack) {
-+                replace = biggest > bestBiggestStack;
 +            } else {
 +                replace = dist < bestDist;
 +            }
 +
 +            if (replace) {
 +                bestHasLastItem = hasLast;
-+                bestBiggestStack = biggest;
 +                bestDist = dist;
 +                bestTarget = null;
 +                bestBlockEntity = chestBe; // build target once at end
@@ -371,22 +345,18 @@
 +    }
 +
 +        final boolean hasLast = preferLastItem && paperContainsItemId(candidate.container, lastItemId);
-+        final int biggest = paperBiggestStackSize(candidate.container);
 +
 +        boolean replace = false;
 +        if (bestTarget == null && bestBlockEntity == null) {
 +            replace = true;
 +        } else if (hasLast != bestHasLastItem) {
 +            replace = hasLast;
-+        } else if (biggest != bestBiggestStack) {
-+            replace = biggest > bestBiggestStack;
 +        } else {
 +            replace = dist < bestDist;
 +        }
 +
 +        if (replace) {
 +            bestHasLastItem = hasLast;
-+            bestBiggestStack = biggest;
 +            bestDist = dist;
 +            bestTarget = candidate;
 +            bestBlockEntity = null;
@@ -420,33 +390,11 @@
 +        golem.paperSetLastItemId("", now, 0);
 +    }
 +
-+    private static int paperBiggestStackSize(final Container container) {
-+        int best = 0;
-+        for (ItemStack s : container) {
-+            if (!s.isEmpty() && s.getCount() > best) best = s.getCount();
-+        }
-+        return best;
-+    }
-+
 +    private static boolean paperContainsItemId(final Container container, final String itemId) {
 +        for (ItemStack s : container) {
 +            if (!s.isEmpty() && itemId.equals(paperItemId(s))) return true;
 +        }
 +        return false;
-+    }
-+
-+    // Chest fast-path helpers (avoid ChestBlock.getContainer during scan)
-+    private static int paperBiggestStackSizeChest(final ChestBlockEntity a, final @Nullable ChestBlockEntity b) {
-+        int best = 0;
-+        for (ItemStack s : a) {
-+            if (!s.isEmpty() && s.getCount() > best) best = s.getCount();
-+        }
-+        if (b != null) {
-+            for (ItemStack s : b) {
-+                if (!s.isEmpty() && s.getCount() > best) best = s.getCount();
-+            }
-+        }
-+        return best;
 +    }
 +
 +    private static boolean paperContainsItemIdChest(final ChestBlockEntity a, final @Nullable ChestBlockEntity b, final String itemId) {
@@ -618,167 +566,193 @@
      }
  
      private static boolean isPickingUpItems(PathfinderMob mob) {
-@@ -500,38 +_,134 @@
-         return false;
+@@ -501,36 +_,169 @@
      }
  
--    private void pickUpItems(PathfinderMob mob, Container container) {
+     private void pickUpItems(PathfinderMob mob, Container container) {
 -        mob.setItemSlot(EquipmentSlot.MAINHAND, pickupItemFromContainer(container));
--        mob.setGuaranteedDrop(EquipmentSlot.MAINHAND);
--        container.setChanged();
-+private void pickUpItems(PathfinderMob mob, Container container) {
-+    final int pickupLimit;
-+    if (mob.level() instanceof ServerLevel serverLevel) {
-+        pickupLimit = this.paperPickupMaxItemsHeld(serverLevel, mob);
-+    } else {
-+        pickupLimit = TRANSPORTED_ITEM_MAX_STACK_SIZE;
-+    }
++        final int pickupLimit;
++        if (mob.level() instanceof ServerLevel serverLevel) {
++            pickupLimit = this.paperPickupMaxItemsHeld(serverLevel, mob);
++        } else {
++            pickupLimit = TRANSPORTED_ITEM_MAX_STACK_SIZE;
++        }
 +
-+    // Paper/Folia CopperGolem AI: use last-item memory to choose WHAT item is picked up.
-+    final @Nullable String preferredItemId;
-+    if (mob instanceof CopperGolem golem && mob.level() instanceof ServerLevel serverLevel) {
-+        final var cfg = serverLevel.paperConfig().entities.copperGolem;
-+        if (cfg.enabled && cfg.intelligence.rememberLastItem) {
-+            final long now = serverLevel.getGameTime();
-+            preferredItemId = golem.paperIsMemoryValid(now) ? golem.paperLastItemId() : null;
++        // Paper/Folia CopperGolem AI: use last-item memory to choose WHAT item is picked up.
++        final @Nullable String preferredItemId;
++        if (mob instanceof CopperGolem golem && mob.level() instanceof ServerLevel serverLevel) {
++            final var cfg = serverLevel.paperConfig().entities.copperGolem;
++            if (cfg.enabled && cfg.intelligence.rememberLastItem) {
++                final long now = serverLevel.getGameTime();
++                preferredItemId = golem.paperIsMemoryValid(now) ? golem.paperLastItemId() : null;
++            } else {
++                preferredItemId = null;
++            }
 +        } else {
 +            preferredItemId = null;
 +        }
-+    } else {
-+        preferredItemId = null;
-+    }
 +
-+    mob.setItemSlot(EquipmentSlot.MAINHAND, pickupItemFromContainer(container, pickupLimit, preferredItemId));
-+    mob.setGuaranteedDrop(EquipmentSlot.MAINHAND);
-+    container.setChanged();
-+    this.clearMemoriesAfterMatchingTargetFound(mob);
-+
-+    // Paper/Folia CopperGolem AI (RFC v1.0): remember last item + hard sleep cooldown
-+    if (mob instanceof CopperGolem golem && mob.level() instanceof ServerLevel serverLevel) {
-+        final var cfg = serverLevel.paperConfig().entities.copperGolem;
-+        if (cfg.enabled) {
-+            final long now = serverLevel.getGameTime();
-+            if (cfg.intelligence.rememberLastItem) {
-+                final ItemStack hand = mob.getMainHandItem();
-+                if (!hand.isEmpty()) {
-+                    final String itemId = String.valueOf(BuiltInRegistries.ITEM.getKey(hand.getItem()));
-+                    golem.paperSetLastItemId(itemId, now, cfg.intelligence.memoryTtlTicks);
-+                }
-+            }
-+            if (cfg.pickup.pickupCooldownTicks > 0) {
-+                final int cd = cfg.pickup.pickupCooldownTicks;
-+                mob.getBrain().setMemory(MemoryModuleType.TRANSPORT_ITEMS_COOLDOWN_TICKS, cd);
-+            }
-+        }
-+    }
-+}
-+
-+private void putDownItem(PathfinderMob mob, Container container) {
-+    ItemStack remaining = addItemsToContainer(mob, container);
-+    container.setChanged();
-+    mob.setItemSlot(EquipmentSlot.MAINHAND, remaining);
-+
-+    if (remaining.isEmpty()) {
-+        // Paper/Folia CopperGolem AI: remember destination ONLY on full success (hand emptied).
-+        if (mob instanceof CopperGolem golem && mob.level() instanceof ServerLevel serverLevel && this.target != null) {
-+            final var cfg = serverLevel.paperConfig().entities.copperGolem;
-+            if (cfg.enabled && cfg.intelligence.rememberDestination) {
-+                final long now = serverLevel.getGameTime();
-+                golem.paperSetLastDestinationPackedPos(this.target.pos.asLong(), now, cfg.intelligence.destinationLockTicks);
-+            }
-+        }
-+
++        mob.setItemSlot(EquipmentSlot.MAINHAND, pickupItemFromContainer(container, pickupLimit, preferredItemId));
+         mob.setGuaranteedDrop(EquipmentSlot.MAINHAND);
+         container.setChanged();
          this.clearMemoriesAfterMatchingTargetFound(mob);
--    }
--
--    private void putDownItem(PathfinderMob mob, Container container) {
--        ItemStack itemStack = addItemsToContainer(mob, container);
--        container.setChanged();
--        mob.setItemSlot(EquipmentSlot.MAINHAND, itemStack);
--        if (itemStack.isEmpty()) {
--            this.clearMemoriesAfterMatchingTargetFound(mob);
--        } else {
--            this.stopTargetingCurrentTarget(mob);
--        }
--    }
--
--    private static ItemStack pickupItemFromContainer(Container container) {
 +
-+        if (mob instanceof CopperGolem && mob.level() instanceof ServerLevel serverLevel) {
-+            final var cfg = serverLevel.paperConfig().entities.copperGolem;
-+            if (cfg.enabled && cfg.pickup.putdownCooldownTicks > 0) {
-+                final int cd = cfg.pickup.putdownCooldownTicks;
-+                mob.getBrain().setMemory(MemoryModuleType.TRANSPORT_ITEMS_COOLDOWN_TICKS, cd);
-+            }
-+        }
-+    } else {
-+        // Could not empty hand -> scanning again is correct, but do not keep reusing a stale destination lock.
++        // Paper/Folia CopperGolem AI (RFC v1.0): remember last item + hard sleep cooldown
 +        if (mob instanceof CopperGolem golem && mob.level() instanceof ServerLevel serverLevel) {
 +            final var cfg = serverLevel.paperConfig().entities.copperGolem;
-+            if (cfg.enabled && cfg.intelligence.rememberDestination) {
++            if (cfg.enabled) {
 +                final long now = serverLevel.getGameTime();
-+                paperClearDestinationLock(golem, now);
++                if (cfg.intelligence.rememberLastItem) {
++                    final ItemStack hand = mob.getMainHandItem();
++                    if (!hand.isEmpty()) {
++                        final String itemId = String.valueOf(BuiltInRegistries.ITEM.getKey(hand.getItem()));
++                        golem.paperSetLastItemId(itemId, now, cfg.intelligence.memoryTtlTicks);
++                    }
++                }
++                if (cfg.pickup.pickupCooldownTicks > 0) {
++                    final int cd = cfg.pickup.pickupCooldownTicks;
++                    mob.getBrain().setMemory(MemoryModuleType.TRANSPORT_ITEMS_COOLDOWN_TICKS, cd);
++                }
 +            }
 +        }
+     }
+ 
+     private void putDownItem(PathfinderMob mob, Container container) {
+-        ItemStack itemStack = addItemsToContainer(mob, container);
++        ItemStack remaining = addItemsToContainer(mob, container);
+         container.setChanged();
+-        mob.setItemSlot(EquipmentSlot.MAINHAND, itemStack);
+-        if (itemStack.isEmpty()) {
++        mob.setItemSlot(EquipmentSlot.MAINHAND, remaining);
 +
-+        this.stopTargetingCurrentTarget(mob);
-+    }
-+}
++        if (remaining.isEmpty()) {
++            // Paper/Folia CopperGolem AI: remember destination ONLY on full success (hand emptied).
++            if (mob instanceof CopperGolem golem && mob.level() instanceof ServerLevel serverLevel && this.target != null) {
++                final var cfg = serverLevel.paperConfig().entities.copperGolem;
++                if (cfg.enabled && cfg.intelligence.rememberDestination) {
++                    final long now = serverLevel.getGameTime();
++                    golem.paperSetLastDestinationPackedPos(this.target.pos.asLong(), now, cfg.intelligence.destinationLockTicks);
++                }
++            }
 +
-+private static ItemStack pickupItemFromContainer(final Container container, final int pickupLimit) {
-+    return pickupItemFromContainer(container, pickupLimit, null);
-+}
+             this.clearMemoriesAfterMatchingTargetFound(mob);
 +
-+private static ItemStack pickupItemFromContainer(final Container container, final int pickupLimit, final @Nullable String preferredItemId) {
-+    final int limit = Math.max(1, pickupLimit);
++            if (mob instanceof CopperGolem && mob.level() instanceof ServerLevel serverLevel) {
++                final var cfg = serverLevel.paperConfig().entities.copperGolem;
++                if (cfg.enabled && cfg.pickup.putdownCooldownTicks > 0) {
++                    final int cd = cfg.pickup.putdownCooldownTicks;
++                    mob.getBrain().setMemory(MemoryModuleType.TRANSPORT_ITEMS_COOLDOWN_TICKS, cd);
++                }
++            }
+         } else {
++            // Could not empty hand -> scanning again is correct, but do not keep reusing a stale destination lock.
++            if (mob instanceof CopperGolem golem && mob.level() instanceof ServerLevel serverLevel) {
++                final var cfg = serverLevel.paperConfig().entities.copperGolem;
++                if (cfg.enabled && cfg.intelligence.rememberDestination) {
++                    final long now = serverLevel.getGameTime();
++                    paperClearDestinationLock(golem, now);
++                }
++            }
 +
-+    // 1) If last item is remembered: pick FIRST slot position that matches.
-+    if (preferredItemId != null && !preferredItemId.isEmpty()) {
-         int i = 0;
+             this.stopTargetingCurrentTarget(mob);
+         }
++    }   
++
++    private static ItemStack pickupItemFromContainer(final Container container, final int pickupLimit) {
++        return pickupItemFromContainer(container, pickupLimit, null);
+     }
+ 
+-    private static ItemStack pickupItemFromContainer(Container container) {
+-        int i = 0;
 -
 -        for (ItemStack itemStack : container) {
 -            if (!itemStack.isEmpty()) {
 -                int min = Math.min(itemStack.getCount(), 16);
-+        for (ItemStack s : container) {
-+            if (!s.isEmpty() && preferredItemId.equals(paperItemId(s))) {
-+                final int min = Math.min(s.getCount(), limit);
-                 return container.removeItem(i, min);
-             }
+-                return container.removeItem(i, min);
+-            }
 -
-             i++;
-         }
+-            i++;
+-        }
 -
 -        return ItemStack.EMPTY;
--    }
-+        // If the preferred item isn't present, fall through to largest-stack selection.
-+    }
++    private static ItemStack pickupItemFromContainer(final Container container, final int pickupLimit, final @Nullable String preferredItemId) {
++        final int limit = Math.max(1, pickupLimit);
 +
-+    // 2) If no last item remembered (or not found): pick LARGEST stack, tie-break FIRST slot position.
-+    int bestIndex = -1;
-+    int bestCount = 0;
++        String selectedItemId = null;
 +
-+    int i = 0;
-+    for (ItemStack s : container) {
-+        if (!s.isEmpty()) {
-+            final int count = s.getCount();
-+            if (bestIndex == -1 || count > bestCount) { // '>' preserves first-slot tie-break
-+                bestIndex = i;
-+                bestCount = count;
++        // 1) If last item is remembered and present, commit to that item type.
++        if (preferredItemId != null && !preferredItemId.isEmpty()) {
++            for (ItemStack s : container) {
++                if (!s.isEmpty() && preferredItemId.equals(paperItemId(s))) {
++                    selectedItemId = preferredItemId;
++                    break;
++                }
 +            }
 +        }
-+        i++;
-+    }
 +
-+    if (bestIndex != -1) {
-+        final int min = Math.min(bestCount, limit);
-+        return container.removeItem(bestIndex, min);
-+    }
++        // 2) Otherwise, choose the item type with the greatest total quantity across the container.
++        if (selectedItemId == null) {
++            String bestItemId = null;
++            int bestTotal = 0;
 +
-+    return ItemStack.EMPTY;
-+}
++            for (int i = 0; i < container.getContainerSize(); i++) {
++                final ItemStack s = container.getItem(i);
++                if (s.isEmpty()) {
++                    continue;
++                }
++
++                final String itemId = paperItemId(s);
++                int total = 0;
++
++                for (int j = 0; j < container.getContainerSize(); j++) {
++                    final ItemStack other = container.getItem(j);
++                    if (!other.isEmpty() && itemId.equals(paperItemId(other))) {
++                        total += other.getCount();
++                    }
++                }
++
++                if (bestItemId == null || total > bestTotal) {
++                    bestItemId = itemId;
++                    bestTotal = total;
++                }
++            }
++
++            selectedItemId = bestItemId;
++        }
++
++        if (selectedItemId == null) {
++            return ItemStack.EMPTY;
++        }
++
++        ItemStack carried = ItemStack.EMPTY;
++        int remaining = limit;
++
++        for (int i = 0; i < container.getContainerSize() && remaining > 0; i++) {
++            final ItemStack slotStack = container.getItem(i);
++            if (slotStack.isEmpty() || !selectedItemId.equals(paperItemId(slotStack))) {
++                continue;
++            }
++
++            final int toRemove = Math.min(slotStack.getCount(), remaining);
++            final ItemStack removed = container.removeItem(i, toRemove);
++
++            if (removed.isEmpty()) {
++                continue;
++            }
++    
++            if (carried.isEmpty()) {
++                carried = removed;
++            } else {
++                carried.grow(removed.getCount());
++            }
++
++            remaining -= removed.getCount();
++        }
++
++        return carried;
+     }
  
      private static ItemStack addItemsToContainer(PathfinderMob mob, Container container) {
-         int i = 0;
 @@ -547,7 +_,7 @@
                  int i1 = itemStack.getMaxStackSize() - itemStack.getCount();
                  int min = Math.min(i1, mainHandItem.getCount());
