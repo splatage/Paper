@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: splatage <noj.melville@gmail.com>
+Date: Sat, 7 Mar 2026 18:24:34 +1300
+Subject: [PATCH] Add hybrid mob caps and temporary pickup persistence
+
+
+diff --git a/net/minecraft/world/entity/Mob.java b/net/minecraft/world/entity/Mob.java
+index 92175cc019750e829fcad7691a937024c2649882..5880572b01a375c7402e3f0b23be420fd5f02280 100644
+--- a/net/minecraft/world/entity/Mob.java
++++ b/net/minecraft/world/entity/Mob.java
+@@ -142,8 +142,9 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Leashab
+     private DropChances dropChances = DropChances.DEFAULT;
+     private boolean canPickUpLoot = false;
+     private boolean persistenceRequired = false;
+-    private final Map<PathType, Float> pathfindingMalus = Maps.newEnumMap(PathType.class);
+-    public Optional<ResourceKey<LootTable>> lootTable = Optional.empty();
++    private boolean paper$temporaryPickupPersistence = false;
++    private long paper$pickupPersistenceExpiresAt = 0L;
++    private final Map<PathType, Float> pathfindingMalus = Maps.newEnumMap(PathType.class);    public Optional<ResourceKey<LootTable>> lootTable = Optional.empty();
+     public long lootTableSeed;
+     private Leashable.@Nullable LeashData leashData;
+     private BlockPos homePosition = BlockPos.ZERO;
+@@ -438,6 +439,10 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Leashab
+         if (this.despawnInPeacefulOverride != net.kyori.adventure.util.TriState.NOT_SET) {
+             output.putString("Paper.DespawnInPeacefulOverride", this.despawnInPeacefulOverride.name());
+         }
++        if (this.paper$temporaryPickupPersistence) {
++            output.putBoolean("Paper.TemporaryPickupPersistence", true);
++            output.putLong("Paper.PickupPersistenceExpiresAt", this.paper$pickupPersistenceExpiresAt);
++        }
+         // Paper end - allow changing despawnInPeaceful
+     }
+ 
+@@ -468,6 +473,8 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Leashab
+         this.aware = input.getBooleanOr("Bukkit.Aware", true); // CraftBukkit
+         // Paper start - allow changing despawnInPeaceful
+         this.despawnInPeacefulOverride = readDespawnInPeacefulOverride(input);
++        this.paper$temporaryPickupPersistence = input.getBooleanOr("Paper.TemporaryPickupPersistence", false);
++        this.paper$pickupPersistenceExpiresAt = input.getLongOr("Paper.PickupPersistenceExpiresAt", 0L);
+     }
+     public static net.kyori.adventure.util.TriState readDespawnInPeacefulOverride(ValueInput input) {
+         return input.read("Paper.DespawnInPeacefulOverride", io.papermc.paper.util.PaperCodecs.TRI_STATE_CODEC).orElse(net.kyori.adventure.util.TriState.NOT_SET);
+@@ -595,18 +602,25 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Leashab
+         return ITEM_PICKUP_REACH;
+     }
+ 
+-    protected void pickUpItem(ServerLevel level, ItemEntity entity) {
+-        ItemStack item = entity.getItem();
+-        ItemStack itemStack = this.equipItemIfPossible(level, item.copy(), entity); // CraftBukkit - add item
+-        if (!itemStack.isEmpty()) {
+-            this.onItemPickup(entity);
+-            this.take(entity, itemStack.getCount());
+-            item.shrink(itemStack.getCount());
+-            if (item.isEmpty()) {
+-                entity.discard(EntityRemoveEvent.Cause.PICKUP); // CraftBukkit - add Bukkit remove cause
+-            }
++protected void pickUpItem(ServerLevel level, ItemEntity entity) {
++    final boolean wasPersistenceRequired = this.isPersistenceRequired();
++    final boolean hadCustomPersistence = this.requiresCustomPersistence();
++
++    ItemStack item = entity.getItem();
++    ItemStack itemStack = this.equipItemIfPossible(level, item.copy(), entity); // CraftBukkit - add item
++    if (!itemStack.isEmpty()) {
++        if (!wasPersistenceRequired && !hadCustomPersistence && this.paper$isEligibleForTemporaryPickupPersistence(level)) {
++            this.paper$markTemporaryPickupPersistence(level);
++        }
++
++        this.onItemPickup(entity);
++        this.take(entity, itemStack.getCount());
++        item.shrink(itemStack.getCount());
++        if (item.isEmpty()) {
++            entity.discard(EntityRemoveEvent.Cause.PICKUP); // CraftBukkit - add Bukkit remove cause
+         }
+     }
++}
+ 
+     public ItemStack equipItemIfPossible(ServerLevel level, ItemStack stack) {
+         // CraftBukkit start - add item
+@@ -751,45 +765,101 @@ public abstract class Mob extends LivingEntity implements EquipmentUser, Leashab
+         return this.isPassenger();
+     }
+ 
+-    // Paper start - allow changing despawnInPeaceful
+-    public final boolean shouldDespawnInPeaceful() {
+-        return this.despawnInPeacefulOverride.toBooleanOrElse(!this.getType().isTypeAllowedInPeaceful());
++// Paper start - allow changing despawnInPeaceful
++public final boolean shouldDespawnInPeaceful() {
++    return this.despawnInPeacefulOverride.toBooleanOrElse(!this.getType().isTypeAllowedInPeaceful());
++}
++// Paper end - allow changing despawnInPeaceful
++
++private boolean paper$isEligibleForTemporaryPickupPersistence(ServerLevel level) {
++    final io.papermc.paper.configuration.WorldConfiguration.Entities.Spawning.PickupPersistenceExpiry config =
++        level.paperConfig().entities.spawning.pickupPersistenceExpiry;
++
++    if (!config.enabled || config.ticks <= 0) {
++        return false;
++    }
++    if (config.monstersOnly && this.getType().getCategory() != MobCategory.MONSTER) {
++        return false;
++    }
++    if (config.naturalAndChunkGenerationOnly) {
++        final org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason spawnReason = this.spawnReason;
++        if (spawnReason == null) {
++            return false;
++        }
++        if (spawnReason != org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason.NATURAL
++            && spawnReason != org.bukkit.event.entity.CreatureSpawnEvent.SpawnReason.CHUNK_GEN) {
++            return false;
++        }
+     }
+-    // Paper end - allow changing despawnInPeaceful
+ 
+-    @Override
+-    public void checkDespawn() {
+-        if (this.level().getDifficulty() == Difficulty.PEACEFUL && this.shouldDespawnInPeaceful()) { // Paper - allow changing despawnInPeaceful
+-            this.discard(EntityRemoveEvent.Cause.DESPAWN); // CraftBukkit - add Bukkit remove cause
+-        } else if (!this.isPersistenceRequired() && !this.requiresCustomPersistence()) {
+-            Entity nearestPlayer = this.level().findNearbyPlayer(this, -1.0, EntitySelector.PLAYER_AFFECTS_SPAWNING); // Paper - Affects Spawning API
+-            if (nearestPlayer != null) {
+-                // Paper start - Configurable despawn distances
+-                final io.papermc.paper.configuration.WorldConfiguration.Entities.Spawning.DespawnRangePair despawnRangePair = this.level().paperConfig().entities.spawning.despawnRanges.get(this.getType().getCategory());
+-                final io.papermc.paper.configuration.type.DespawnRange.Shape shape = this.level().paperConfig().entities.spawning.despawnRangeShape;
+-                final double dy = Math.abs(nearestPlayer.getY() - this.getY());
+-                final double dySqr = Mth.square(dy);
+-                final double dxSqr = Mth.square(nearestPlayer.getX() - this.getX());
+-                final double dzSqr = Mth.square(nearestPlayer.getZ() - this.getZ());
+-                final double distanceSquared = dxSqr + dzSqr + dySqr;
+-                // Despawn if hard/soft limit is exceeded
+-                if (despawnRangePair.hard().shouldDespawn(shape, dxSqr, dySqr, dzSqr, dy) && this.removeWhenFarAway(distanceSquared)) {
+-                    this.discard(EntityRemoveEvent.Cause.DESPAWN); // CraftBukkit - add Bukkit remove cause
+-                 }
++    return true;
++}
+ 
+-                if (despawnRangePair.soft().shouldDespawn(shape, dxSqr, dySqr, dzSqr, dy)) {
+-                    if (this.noActionTime > 600 && this.random.nextInt(800) == 0 && this.removeWhenFarAway(distanceSquared)) {
+-                        this.discard(EntityRemoveEvent.Cause.DESPAWN); // CraftBukkit - add Bukkit remove cause
+-                    }
+-                } else {
+-                    // Paper end - Configurable despawn distances
+-                    this.noActionTime = 0;
++private void paper$markTemporaryPickupPersistence(ServerLevel level) {
++    this.paper$temporaryPickupPersistence = true;
++    this.paper$pickupPersistenceExpiresAt = level.getGameTime() + level.paperConfig().entities.spawning.pickupPersistenceExpiry.ticks;
++}
++
++private boolean paper$hasExplicitPickupPersistenceExemption() {
++    return this.hasCustomName() || this.isLeashed() || this.isVehicle();
++}
++
++private boolean paper$shouldBlockNaturalDespawn(ServerLevel level) {
++    if (this.requiresCustomPersistence()) {
++        return true;
++    }
++    if (this.paper$hasExplicitPickupPersistenceExemption()) {
++        return true;
++    }
++    if (!this.isPersistenceRequired()) {
++        return false;
++    }
++    if (!this.paper$temporaryPickupPersistence) {
++        return true;
++    }
++    if (level.getGameTime() < this.paper$pickupPersistenceExpiresAt) {
++        return true;
++    }
++
++    this.paper$temporaryPickupPersistence = false;
++    this.paper$pickupPersistenceExpiresAt = 0L;
++    this.persistenceRequired = false;
++    return false;
++}
++
++@Override
++public void checkDespawn() {
++    if (this.level().getDifficulty() == Difficulty.PEACEFUL && this.shouldDespawnInPeaceful()) { // Paper - allow changing despawnInPeaceful
++        this.discard(EntityRemoveEvent.Cause.DESPAWN); // CraftBukkit - add Bukkit remove cause
++    } else if (!this.paper$shouldBlockNaturalDespawn((ServerLevel) this.level())) {
++        Entity nearestPlayer = this.level().findNearbyPlayer(this, -1.0, EntitySelector.PLAYER_AFFECTS_SPAWNING); // Paper - Affects Spawning API
++        if (nearestPlayer != null) {
++            // Paper start - Configurable despawn distances
++            final io.papermc.paper.configuration.WorldConfiguration.Entities.Spawning.DespawnRangePair despawnRangePair = this.level().paperConfig().entities.spawning.despawnRanges.get(this.getType().getCategory());
++            final io.papermc.paper.configuration.type.DespawnRange.Shape shape = this.level().paperConfig().entities.spawning.despawnRangeShape;
++            final double dy = Math.abs(nearestPlayer.getY() - this.getY());
++            final double dySqr = Mth.square(dy);
++            final double dxSqr = Mth.square(nearestPlayer.getX() - this.getX());
++            final double dzSqr = Mth.square(nearestPlayer.getZ() - this.getZ());
++            final double distanceSquared = dxSqr + dzSqr + dySqr;
++            // Despawn if hard/soft limit is exceeded
++            if (despawnRangePair.hard().shouldDespawn(shape, dxSqr, dySqr, dzSqr, dy) && this.removeWhenFarAway(distanceSquared)) {
++                this.discard(EntityRemoveEvent.Cause.DESPAWN); // CraftBukkit - add Bukkit remove cause
++             }
++
++            if (despawnRangePair.soft().shouldDespawn(shape, dxSqr, dySqr, dzSqr, dy)) {
++                if (this.noActionTime > 600 && this.random.nextInt(800) == 0 && this.removeWhenFarAway(distanceSquared)) {
++                    this.discard(EntityRemoveEvent.Cause.DESPAWN); // CraftBukkit - add Bukkit remove cause
+                 }
++            } else {
++                // Paper end - Configurable despawn distances
++                this.noActionTime = 0;
+             }
+-        } else {
+-            this.noActionTime = 0;
+         }
++    } else {
++        this.noActionTime = 0;
+     }
++}
+ 
+     @Override
+     protected final void serverAiStep() {
+diff --git a/net/minecraft/world/level/NaturalSpawner.java b/net/minecraft/world/level/NaturalSpawner.java
+index 4e5078495037078922ab6350a500acdabe177ca5..8f6de2ee1a0aefd308593b1841ad63765c7fb5d7 100644
+--- a/net/minecraft/world/level/NaturalSpawner.java
++++ b/net/minecraft/world/level/NaturalSpawner.java
+@@ -142,9 +142,14 @@ public final class NaturalSpawner {
+                 continue;
+             }
+ 
++            final io.papermc.paper.configuration.WorldConfiguration.Entities.Spawning.HybridMobCaps hybridMobCaps =
++                level.paperConfig().entities.spawning.hybridMobCaps;
++            final int hardLimit = hybridMobCaps.enabled ? hybridMobCaps.hardLimits.getInt(mobCategory) : -1;
++
+             if ((spawnFriendlies || !mobCategory.isFriendly())
+                 && (spawnEnemies || mobCategory.isFriendly())
+                 && (spawnPassives || !mobCategory.isPersistent())
++                && spawnState.canSpawnForCategoryHardLimit(mobCategory, hardLimit)
+                 && (level.paperConfig().entities.spawning.perPlayerMobSpawns || spawnState.canSpawnForCategoryGlobal(mobCategory, limit))) { // Paper - Optional per player mob spawns; remove global check, check later during the local one
+                 list.add(mobCategory);
+                 // CraftBukkit end
+@@ -162,6 +167,10 @@ public final class NaturalSpawner {
+             // Paper start - Optional per player mob spawns
+             final boolean canSpawn;
+             int maxSpawns = Integer.MAX_VALUE;
++            final io.papermc.paper.configuration.WorldConfiguration.Entities.Spawning.HybridMobCaps hybridMobCaps =
++                level.paperConfig().entities.spawning.hybridMobCaps;
++            final int hardLimit = hybridMobCaps.enabled ? hybridMobCaps.hardLimits.getInt(mobCategory) : -1;
++
+             if (level.paperConfig().entities.spawning.perPlayerMobSpawns) {
+                 // Copied from getFilteredSpawningCategories
+                 int limit = mobCategory.getMaxInstancesPerChunk();
+@@ -186,7 +195,9 @@ public final class NaturalSpawner {
+             } else {
+                 canSpawn = spawnState.canSpawnForCategoryLocal(mobCategory, chunk.getPos());
+             }
+-            if (canSpawn) {
++
++            maxSpawns = Math.min(maxSpawns, spawnState.remainingSpawnSlotsForCategoryHardLimit(mobCategory, hardLimit));
++            if (canSpawn && maxSpawns > 0) {
+                 spawnCategoryForChunk(mobCategory, level, chunk, spawnState::canSpawn, spawnState::afterSpawn,
+                     maxSpawns, level.paperConfig().entities.spawning.perPlayerMobSpawns ? level.getChunkSource().chunkMap::updatePlayerMobTypeMap : null);
+                 // Paper end - Optional per player mob spawns
+@@ -640,6 +651,7 @@ public final class NaturalSpawner {
+             return this.unmodifiableMobCategoryCounts;
+         }
+ 
++        // CraftBukkit start
+         // CraftBukkit start
+         boolean canSpawnForCategoryGlobal(MobCategory category, int limit) {
+             int i = limit * this.spawnableChunkCount / NaturalSpawner.MAGIC_NUMBER;
+@@ -647,6 +659,14 @@ public final class NaturalSpawner {
+             return this.mobCategoryCounts.getInt(category) < i;
+         }
+ 
++        boolean canSpawnForCategoryHardLimit(MobCategory category, int hardLimit) {
++            return this.remainingSpawnSlotsForCategoryHardLimit(category, hardLimit) > 0;
++        }
++
++        int remainingSpawnSlotsForCategoryHardLimit(MobCategory category, int hardLimit) {
++            return hardLimit < 0 ? Integer.MAX_VALUE : Math.max(0, hardLimit - this.mobCategoryCounts.getInt(category));
++        }
++
+         boolean canSpawnForCategoryLocal(MobCategory category, ChunkPos chunkPos) {
+             return this.localMobCapCalculator.canSpawn(category, chunkPos) || SharedConstants.DEBUG_IGNORE_LOCAL_MOB_CAP;
+         }
