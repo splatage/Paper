@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: splatage <noj.melville@gmail.com>
+Date: Sat, 7 Mar 2026 23:29:11 +1300
+Subject: [PATCH] Fix a reversion where aggrregation logic was resetting
+ batches
+
+
+diff --git a/net/minecraft/world/entity/ai/behavior/TransportItemsBetweenContainers.java b/net/minecraft/world/entity/ai/behavior/TransportItemsBetweenContainers.java
+index 01063a67cb8a56a62f8e551cdb5e670de0b2a8c2..55e66f0e31c1ad54bd3fba7ed82d8031d90be83a 100644
+--- a/net/minecraft/world/entity/ai/behavior/TransportItemsBetweenContainers.java
++++ b/net/minecraft/world/entity/ai/behavior/TransportItemsBetweenContainers.java
+@@ -860,14 +860,15 @@ import org.jspecify.annotations.Nullable;
+         container.setChanged();
+         this.clearMemoriesAfterMatchingTargetFound(mob);
+ 
+-        // Paper/Folia CopperGolem AI (RFC v1.0): remember last item + hard sleep cooldown
++        // Paper/Folia CopperGolem AI (RFC v1.0): preserve current batch intent.
++        // Only establish remembered item when there is no currently valid memory.
+         if (mob instanceof CopperGolem golem && mob.level() instanceof ServerLevel serverLevel) {
+             final var cfg = serverLevel.paperConfig().entities.copperGolem;
+             if (cfg.enabled) {
+                 final long now = serverLevel.getGameTime();
+                 if (cfg.intelligence.rememberLastItem) {
+                     final ItemStack hand = mob.getMainHandItem();
+-                    if (!hand.isEmpty()) {
++                    if (!hand.isEmpty() && !golem.paperIsMemoryValid(now)) {
+                         final String itemId = String.valueOf(BuiltInRegistries.ITEM.getKey(hand.getItem()));
+                         golem.paperSetLastItemId(itemId, now, cfg.intelligence.memoryTtlTicks);
+                     }
