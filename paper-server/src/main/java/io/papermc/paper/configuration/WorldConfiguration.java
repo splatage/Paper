@@ -290,11 +290,18 @@ public class WorldConfiguration extends ConfigurationPart {
             public boolean scanForLegacyEnderDragon = true;
             @MergeMap
             public Reference2IntMap<MobCategory> spawnLimits = Util.make(new Reference2IntOpenHashMap<>(NaturalSpawner.SPAWNING_CATEGORIES.length), map -> Arrays.stream(NaturalSpawner.SPAWNING_CATEGORIES).forEach(mobCategory -> map.put(mobCategory, -1)));
+            public HybridMobCaps hybridMobCaps;
             @MergeMap
             public Map<MobCategory, DespawnRangePair> despawnRanges = Arrays.stream(MobCategory.values()).collect(Collectors.toMap(Function.identity(), category -> DespawnRangePair.createDefault()));
             public DespawnRange.Shape despawnRangeShape = DespawnRange.Shape.ELLIPSOID;
             @MergeMap
             public Reference2IntMap<MobCategory> ticksPerSpawn = Util.make(new Reference2IntOpenHashMap<>(NaturalSpawner.SPAWNING_CATEGORIES.length), map -> Arrays.stream(NaturalSpawner.SPAWNING_CATEGORIES).forEach(mobCategory -> map.put(mobCategory, -1)));
+
+            public class HybridMobCaps extends ConfigurationPart {
+                public boolean enabled = false;
+                @MergeMap
+                public Reference2IntMap<MobCategory> hardLimits = Util.make(new Reference2IntOpenHashMap<>(NaturalSpawner.SPAWNING_CATEGORIES.length), map -> Arrays.stream(NaturalSpawner.SPAWNING_CATEGORIES).forEach(mobCategory -> map.put(mobCategory, -1)));
+            }
 
             @ConfigSerializable
             public record DespawnRangePair(@Required DespawnRange hard, @Required DespawnRange soft) {
@@ -310,6 +317,14 @@ public class WorldConfiguration extends ConfigurationPart {
                 map.put(EntityType.SNOWBALL, IntOr.Disabled.DISABLED);
                 map.put(EntityType.LLAMA_SPIT, IntOr.Disabled.DISABLED);
             });
+            public PickupPersistenceExpiry pickupPersistenceExpiry;
+
+            public class PickupPersistenceExpiry extends ConfigurationPart {
+                public boolean enabled = false;
+                public boolean monstersOnly = true;
+                public boolean naturalAndChunkGenerationOnly = true;
+                public int ticks = 20 * 60 * 15;
+            }
 
             @PostProcess
             public void precomputeDespawnDistances() throws SerializationException {
